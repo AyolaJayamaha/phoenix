@@ -122,6 +122,7 @@ tokens
     JAR='jar';
     DEFAULTVALUE='defaultvalue';
     CONSTANT = 'constant';
+    REPLACE = 'replace';
 }
 
 
@@ -540,12 +541,12 @@ trace_node returns [TraceStatement ret]
 
 // Parse a trace statement.
 create_function_node returns [CreateFunctionStatement ret]
-    :   CREATE (temp=TEMPORARY)? FUNCTION function=identifier 
+    :   CREATE (OR replace=REPLACE)? (temp=TEMPORARY)? FUNCTION function=identifier 
        (LPAREN args=zero_or_more_data_types RPAREN)
        RETURNS r=identifier AS (className= jar_path)
        (USING JAR (jarPath = jar_path))?
         {
-            $ret = factory.createFunction(new PFunction(SchemaUtil.normalizeIdentifier(function), args,r,(String)className.getValue(), jarPath == null ? null : (String)jarPath.getValue()), temp!=null);;
+            $ret = factory.createFunction(new PFunction(SchemaUtil.normalizeIdentifier(function), args,r,(String)className.getValue(), jarPath == null ? null : (String)jarPath.getValue()), temp!=null, replace!=null);
         } 
     ;
 
@@ -629,7 +630,7 @@ single_select returns [SelectStatement ret]
 @init{ contextStack.push(new ParseContext()); }
     :   SELECT (h=hintClause)? 
         (d=DISTINCT | ALL)? sel=select_list
-        FROM from=parseFrom
+        (FROM from=parseFrom)?
         (WHERE where=expression)?
         (GROUP BY group=group_by)?
         (HAVING having=expression)?
@@ -902,7 +903,10 @@ term returns [ParseNode ret]
         }
     |   (n=NEXT | CURRENT) VALUE FOR s=from_table_name 
         { contextStack.peek().hasSequences(true);
-          $ret = n==null ? factory.currentValueFor(s) : factory.nextValueFor(s); }    
+          $ret = n==null ? factory.currentValueFor(s) : factory.nextValueFor(s, null); }    
+    |   (n=NEXT) lorb=literal_or_bind VALUES FOR s=from_table_name 
+        { contextStack.peek().hasSequences(true);
+          $ret = factory.nextValueFor(s, lorb); }    
     ;
 
 one_or_more_expressions returns [List<ParseNode> ret]

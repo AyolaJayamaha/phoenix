@@ -116,6 +116,7 @@ import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.schema.ExecuteQueryNotApplicableException;
 import org.apache.phoenix.schema.ExecuteUpdateNotApplicableException;
+import org.apache.phoenix.schema.FunctionNotFoundException;
 import org.apache.phoenix.schema.MetaDataClient;
 import org.apache.phoenix.schema.PDatum;
 import org.apache.phoenix.schema.PIndexState;
@@ -231,7 +232,7 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
     }
     
     protected QueryPlan optimizeQuery(CompilableStatement stmt) throws SQLException {
-        QueryPlan plan = stmt.compilePlan(this, Sequence.ValueOp.RESERVE_SEQUENCE);
+        QueryPlan plan = stmt.compilePlan(this, Sequence.ValueOp.VALIDATE_SEQUENCE);
         return connection.getQueryServices().getOptimizer().optimize(this, plan);
     }
     
@@ -244,7 +245,7 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
                     public PhoenixResultSet call() throws SQLException {
                     final long startTime = System.currentTimeMillis();
                     try {
-                        QueryPlan plan = stmt.compilePlan(PhoenixStatement.this, Sequence.ValueOp.RESERVE_SEQUENCE);
+                        QueryPlan plan = stmt.compilePlan(PhoenixStatement.this, Sequence.ValueOp.VALIDATE_SEQUENCE);
                         plan = connection.getQueryServices().getOptimizer().optimize(
                                 PhoenixStatement.this, plan);
                          // this will create its own trace internally, so we don't wrap this
@@ -302,7 +303,7 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
                             // since they'd update data directly from coprocessors, and should thus operate on
                             // the latest state
                             try {
-                                MutationPlan plan = stmt.compilePlan(PhoenixStatement.this, Sequence.ValueOp.RESERVE_SEQUENCE);
+                                MutationPlan plan = stmt.compilePlan(PhoenixStatement.this, Sequence.ValueOp.VALIDATE_SEQUENCE);
                                 MutationState state = plan.execute();
                                 connection.getMutationState().join(state);
                                 if (connection.getAutoCommit()) {
@@ -354,7 +355,7 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
         @Override
         public QueryPlan compilePlan(PhoenixStatement stmt, Sequence.ValueOp seqAction) throws SQLException {
             if(!getUdfParseNodes().isEmpty()) {
-                stmt.throwIfUnallowedUserDefinedFunctions();
+                stmt.throwIfUnallowedUserDefinedFunctions(getUdfParseNodes());
             }
             SelectStatement select = SubselectRewriter.flatten(this, stmt.getConnection());
             ColumnResolver resolver = FromCompiler.getResolverForQuery(select, stmt.getConnection());
@@ -531,7 +532,7 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
         @Override
         public MutationPlan compilePlan(PhoenixStatement stmt, Sequence.ValueOp seqAction) throws SQLException {
             if(!getUdfParseNodes().isEmpty()) {
-                stmt.throwIfUnallowedUserDefinedFunctions();
+                stmt.throwIfUnallowedUserDefinedFunctions(getUdfParseNodes());
             }
             UpsertCompiler compiler = new UpsertCompiler(stmt);
             MutationPlan plan = compiler.compile(this);
@@ -549,7 +550,7 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
         @Override
         public MutationPlan compilePlan(PhoenixStatement stmt, Sequence.ValueOp seqAction) throws SQLException {
             if(!getUdfParseNodes().isEmpty()) {
-                stmt.throwIfUnallowedUserDefinedFunctions();
+                stmt.throwIfUnallowedUserDefinedFunctions(getUdfParseNodes());
             }
             DeleteCompiler compiler = new DeleteCompiler(stmt);
             MutationPlan plan = compiler.compile(this);
@@ -575,15 +576,15 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
 
     private static class ExecutableCreateFunctionStatement extends CreateFunctionStatement implements CompilableStatement {
 
-        public ExecutableCreateFunctionStatement(PFunction functionInfo, boolean temporary) {
-            super(functionInfo, temporary);
+        public ExecutableCreateFunctionStatement(PFunction functionInfo, boolean temporary, boolean isReplace) {
+            super(functionInfo, temporary, isReplace);
         }
 
 
         @SuppressWarnings("unchecked")
         @Override
         public MutationPlan compilePlan(final PhoenixStatement stmt, Sequence.ValueOp seqAction) throws SQLException {
-            stmt.throwIfUnallowedUserDefinedFunctions();
+            stmt.throwIfUnallowedUserDefinedFunctions(Collections.EMPTY_MAP);
             CreateFunctionCompiler compiler = new CreateFunctionCompiler(stmt);
             return compiler.compile(this);
         }
@@ -641,7 +642,7 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
         @Override
         public MutationPlan compilePlan(PhoenixStatement stmt, Sequence.ValueOp seqAction) throws SQLException {
             if(!getUdfParseNodes().isEmpty()) {
-                stmt.throwIfUnallowedUserDefinedFunctions();
+                stmt.throwIfUnallowedUserDefinedFunctions(getUdfParseNodes());
             }
             CreateIndexCompiler compiler = new CreateIndexCompiler(stmt);
             return compiler.compile(this);
@@ -1022,8 +1023,8 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
         }
         
         @Override
-        public CreateFunctionStatement createFunction(PFunction functionInfo, boolean temporary) {
-            return new ExecutableCreateFunctionStatement(functionInfo, temporary);
+        public CreateFunctionStatement createFunction(PFunction functionInfo, boolean temporary, boolean isReplace) {
+            return new ExecutableCreateFunctionStatement(functionInfo, temporary, isReplace);
         }
         @Override
         public DropSequenceStatement dropSequence(TableName tableName, boolean ifExists, int bindCount){
@@ -1202,14 +1203,14 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
         if (stmt.getOperation().isMutation()) {
             throw new ExecuteQueryNotApplicableException(query);
         }
-        return stmt.compilePlan(this, Sequence.ValueOp.RESERVE_SEQUENCE);
+        return stmt.compilePlan(this, Sequence.ValueOp.VALIDATE_SEQUENCE);
     }
 
     public MutationPlan compileMutation(CompilableStatement stmt, String query) throws SQLException {
         if (!stmt.getOperation().isMutation()) {
             throw new ExecuteUpdateNotApplicableException(query);
         }
-        return stmt.compilePlan(this, Sequence.ValueOp.RESERVE_SEQUENCE);
+        return stmt.compilePlan(this, Sequence.ValueOp.VALIDATE_SEQUENCE);
     }
 
     public MutationPlan compileMutation(String sql) throws SQLException {
@@ -1504,14 +1505,17 @@ public class PhoenixStatement implements Statement, SQLCloseable, org.apache.pho
         this.lastQueryPlan = lastQueryPlan;
     }
     
-    private void throwIfUnallowedUserDefinedFunctions() throws SQLException {
+    private void throwIfUnallowedUserDefinedFunctions(Map<String, UDFParseNode> udfParseNodes) throws SQLException {
         if (!connection
                 .getQueryServices()
                 .getProps()
                 .getBoolean(QueryServices.ALLOW_USER_DEFINED_FUNCTIONS_ATTRIB,
                     QueryServicesOptions.DEFAULT_ALLOW_USER_DEFINED_FUNCTIONS)) {
-            throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNALLOWED_USER_DEFINED_FUNCTIONS)
-                    .build().buildException();
+            if(udfParseNodes.isEmpty()) {
+                throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNALLOWED_USER_DEFINED_FUNCTIONS)
+                .build().buildException();
+            }
+            throw new FunctionNotFoundException(udfParseNodes.keySet().toString());
         }
     }
 

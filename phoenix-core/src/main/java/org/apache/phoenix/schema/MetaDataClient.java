@@ -79,6 +79,8 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_TYPE;
 import static org.apache.phoenix.query.QueryConstants.BASE_TABLE_BASE_COLUMN_COUNT;
 import static org.apache.phoenix.query.QueryServices.DROP_METADATA_ATTRIB;
 import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_DROP_METADATA;
+import static org.apache.phoenix.schema.PTable.ViewType.MAPPED;
+import static org.apache.phoenix.schema.PTableType.VIEW;
 
 import java.io.IOException;
 import java.sql.Connection;
@@ -162,6 +164,8 @@ import org.apache.phoenix.parse.PFunction.FunctionArgument;
 import org.apache.phoenix.parse.ParseNode;
 import org.apache.phoenix.parse.ParseNodeFactory;
 import org.apache.phoenix.parse.PrimaryKeyConstraint;
+import org.apache.phoenix.parse.SQLParser;
+import org.apache.phoenix.parse.SelectStatement;
 import org.apache.phoenix.parse.TableName;
 import org.apache.phoenix.parse.UpdateStatisticsStatement;
 import org.apache.phoenix.query.ConnectionQueryServices.Feature;
@@ -1255,7 +1259,7 @@ public class MetaDataClient {
                         dataTable.getTimeStamp());
                     long[] seqValues = new long[1];
                     SQLException[] sqlExceptions = new SQLException[1];
-                    connection.getQueryServices().incrementSequences(Collections.singletonList(key),
+                    connection.getQueryServices().incrementSequences(Collections.singletonList(new SequenceAllocation(key, 1)),
                             Math.max(timestamp, dataTable.getTimeStamp()), seqValues, sqlExceptions);
                     if (sqlExceptions[0] != null) {
                         throw sqlExceptions[0];
@@ -1348,7 +1352,7 @@ public class MetaDataClient {
         boolean wasAutoCommit = connection.getAutoCommit();
         connection.rollback();
         try {
-            PFunction function = new PFunction(stmt.getFunctionInfo(), stmt.isTemporary());
+            PFunction function = new PFunction(stmt.getFunctionInfo(), stmt.isTemporary(), stmt.isReplace());
             connection.setAutoCommit(false);
             String tenantIdStr = connection.getTenantId() == null ? null : connection.getTenantId().getString();
             List<Mutation> functionData = Lists.newArrayListWithExpectedSize(function.getFunctionArguments().size() + 1);
@@ -1377,16 +1381,26 @@ public class MetaDataClient {
             MutationCode code = result.getMutationCode();
             switch(code) {
             case FUNCTION_ALREADY_EXISTS:
-                throw new FunctionAlreadyExistsException(function.getFunctionName(), result
+                if (!function.isReplace()) {
+                    throw new FunctionAlreadyExistsException(function.getFunctionName(), result
                         .getFunctions().get(0));
+                } else {
+                    connection.removeFunction(function.getTenantId(), function.getFunctionName(),
+                        result.getMutationTime());
+                    addFunctionToCache(result);
+                }
             case NEWER_FUNCTION_FOUND:
-                // Add function to ConnectionQueryServices so it's cached, but don't add
-                // it to this connection as we can't see it.
-                throw new NewerFunctionAlreadyExistsException(function.getFunctionName(), result.getFunctions().get(0));
+                    // Add function to ConnectionQueryServices so it's cached, but don't add
+                    // it to this connection as we can't see it.
+                    throw new NewerFunctionAlreadyExistsException(function.getFunctionName(), result.getFunctions().get(0));
             default:
                 List<PFunction> functions = new ArrayList<PFunction>(1);
                 functions.add(function);
                 result = new MetaDataMutationResult(code, result.getMutationTime(), functions, true);
+                if(function.isReplace()) {
+                    connection.removeFunction(function.getTenantId(), function.getFunctionName(),
+                        result.getMutationTime());
+                }
                 addFunctionToCache(result);
             }
         } finally {
@@ -1666,6 +1680,9 @@ public class MetaDataClient {
                             .setTableName(tableName)
                             .setColumnName(column.getName().getString())
                             .build().buildException();
+                    }
+                    if (tableType == PTableType.VIEW && viewType != ViewType.MAPPED) {
+                        throwIfLastPKOfParentIsFixedLength(parent, schemaName, tableName, colDef);
                     }
                     if (!pkColumns.add(column)) {
                         throw new ColumnAlreadyExistsException(schemaName, tableName, column.getName().getString());
@@ -2207,7 +2224,7 @@ public class MetaDataClient {
             if (result.getColumnName() != null) {
                 familyName = result.getFamilyName() == null ? null : Bytes.toString(result.getFamilyName());
                 columnName = Bytes.toString(result.getColumnName());
-                msg = "Cannot drop column referenced by VIEW";
+                msg = "Cannot add/drop column referenced by VIEW";
             }
             throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_MUTATE_TABLE)
                 .setSchemaName(schemaName).setTableName(tableName).setFamilyName(familyName).setColumnName(columnName).setMessage(msg).build().buildException();
@@ -2411,6 +2428,9 @@ public class MetaDataClient {
                                 .setColumnName(colDef.getColumnDefName().getColumnName()).build().buildException();
                             }
                         }
+                        if (colDef != null && colDef.isPK() && table.getType() == VIEW && table.getViewType() != MAPPED) {
+                            throwIfLastPKOfParentIsFixedLength(getParentOfView(table), schemaName, tableName, colDef);
+                        }
                         PColumn column = newColumn(position++, colDef, PrimaryKeyConstraint.EMPTY, table.getDefaultFamilyName() == null ? null : table.getDefaultFamilyName().getString(), true);
                         columns.add(column);
                         String pkName = null;
@@ -2485,7 +2505,7 @@ public class MetaDataClient {
                 }
                 long seqNum = table.getSequenceNumber();
                 if (changingPhoenixTableProperty || columnDefs.size() > 0) { 
-                    seqNum = incrementTableSeqNum(table, statement.getTableType(), 1, isImmutableRows, disableWAL, multiTenant, storeNulls);
+                    seqNum = incrementTableSeqNum(table, statement.getTableType(), columnDefs.size(), isImmutableRows, disableWAL, multiTenant, storeNulls);
                     tableMetaData.addAll(connection.getMutationState().toMutations().next().getSecond());
                     connection.rollback();
                 }
@@ -2946,4 +2966,24 @@ public class MetaDataClient {
         return table.getTableStats();
     }
 
+    private void throwIfLastPKOfParentIsFixedLength(PTable parent, String viewSchemaName, String viewName, ColumnDef col) throws SQLException {
+        if (isLastPKVariableLength(parent)) { 
+            throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_MODIFY_VIEW_PK)
+                .setSchemaName(viewSchemaName)
+                .setTableName(viewName)
+                .setColumnName(col.getColumnDefName().getColumnName())
+                .build().buildException(); }
+    }
+    
+    private boolean isLastPKVariableLength(PTable table) {
+        List<PColumn> pkColumns = table.getPKColumns();
+        return !pkColumns.get(pkColumns.size()-1).getDataType().isFixedWidth();
+    }
+    
+    private PTable getParentOfView(PTable view) throws SQLException {
+    	//TODO just use view.getParentName().getString() after implementing https://issues.apache.org/jira/browse/PHOENIX-2114 
+        SelectStatement select = new SQLParser(view.getViewStatement()).parseQuery();
+        String parentName = SchemaUtil.normalizeFullTableName(select.getFrom().toString().trim());
+        return connection.getMetaDataCache().getTable(new PTableKey(view.getTenantId(), parentName));
+    }
 }

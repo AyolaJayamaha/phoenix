@@ -186,6 +186,7 @@ import org.apache.phoenix.util.ServerUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.Objects;
 import com.google.common.cache.Cache;
 import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
@@ -477,7 +478,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     }
 
     private List<PFunction> buildFunctions(List<byte[]> keys, Region region,
-            long clientTimeStamp) throws IOException, SQLException {
+            long clientTimeStamp, boolean isReplace, List<Mutation> deleteMutationsForReplace) throws IOException, SQLException {
         List<KeyRange> keyRanges = Lists.newArrayListWithExpectedSize(keys.size());
         for (byte[] key : keys) {
             byte[] stopKey = ByteUtil.concat(key, QueryConstants.SEPARATOR_BYTE_ARRAY);
@@ -500,7 +501,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         try {
             for(int i = 0; i< keys.size(); i++) {
                 function = null;
-                function = getFunction(scanner);
+                function =
+                        getFunction(scanner, isReplace, clientTimeStamp, deleteMutationsForReplace);
                 if (function == null) {
                     return null;
                 }
@@ -827,7 +829,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             disableWAL, multiTenant, storeNulls, viewType, viewIndexId, indexType, stats, baseColumnCount);
     }
 
-    private PFunction getFunction(RegionScanner scanner)
+    private PFunction getFunction(RegionScanner scanner, final boolean isReplace, long clientTimeStamp, List<Mutation> deleteMutationsForReplace)
             throws IOException, SQLException {
         List<Cell> results = Lists.newArrayList();
         scanner.next(results);
@@ -836,12 +838,19 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
         }
         Cell[] functionKeyValues = new Cell[FUNCTION_KV_COLUMNS.size()];
         Cell[] functionArgKeyValues = new Cell[FUNCTION_ARG_KV_COLUMNS.size()];
-
         // Create PFunction based on KeyValues from scan
         Cell keyValue = results.get(0);
         byte[] keyBuffer = keyValue.getRowArray();
         int keyLength = keyValue.getRowLength();
         int keyOffset = keyValue.getRowOffset();
+        long currentTimeMillis = EnvironmentEdgeManager.currentTimeMillis();
+        if(isReplace) {
+            long deleteTimeStamp =
+                    clientTimeStamp == HConstants.LATEST_TIMESTAMP ? currentTimeMillis - 1
+                            : (keyValue.getTimestamp() < clientTimeStamp ? clientTimeStamp - 1
+                                    : keyValue.getTimestamp());
+            deleteMutationsForReplace.add(new Delete(keyBuffer, keyOffset, keyLength, deleteTimeStamp));
+        }
         PName tenantId = newPName(keyBuffer, keyOffset, keyLength);
         int tenantIdLength = (tenantId == null) ? 0 : tenantId.getBytes().length;
         if (tenantIdLength == 0) {
@@ -907,6 +916,14 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 break;
             }
             Cell typeKv = results.get(0);
+            if(isReplace) {
+                long deleteTimeStamp =
+                        clientTimeStamp == HConstants.LATEST_TIMESTAMP ? currentTimeMillis - 1
+                                : (typeKv.getTimestamp() < clientTimeStamp ? clientTimeStamp - 1
+                                        : typeKv.getTimestamp());
+                deleteMutationsForReplace.add(new Delete(typeKv.getRowArray(), typeKv
+                        .getRowOffset(), typeKv.getRowLength(), deleteTimeStamp));
+            }
             int typeKeyLength = typeKv.getRowLength();
             PName typeName =
                     newPName(typeKv.getRowArray(), typeKv.getRowOffset() + offset, typeKeyLength
@@ -1019,18 +1036,18 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
     }
 
     private PFunction loadFunction(RegionCoprocessorEnvironment env, byte[] key,
-            ImmutableBytesPtr cacheKey, long clientTimeStamp, long asOfTimeStamp)
+            ImmutableBytesPtr cacheKey, long clientTimeStamp, long asOfTimeStamp, boolean isReplace, List<Mutation> deleteMutationsForReplace)
             throws IOException, SQLException {
             Region region = env.getRegion();
             Cache<ImmutableBytesPtr,PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
             PFunction function = (PFunction)metaDataCache.getIfPresent(cacheKey);
             // We always cache the latest version - fault in if not in cache
-            if (function != null) {
+            if (function != null && !isReplace) {
                 return function;
             }
             ArrayList<byte[]> arrayList = new ArrayList<byte[]>(1);
             arrayList.add(key);
-            List<PFunction> functions = buildFunctions(arrayList, region, asOfTimeStamp);
+            List<PFunction> functions = buildFunctions(arrayList, region, asOfTimeStamp, isReplace, deleteMutationsForReplace);
             if(functions != null) return functions.get(0);
             // if not found then check if newer table already exists and add delete marker for timestamp
             // found
@@ -1550,12 +1567,6 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     // We said to drop a table, but found a view or visa versa
                     if (type != expectedType) { return new MetaDataMutationResult(MutationCode.TABLE_NOT_FOUND,
                             EnvironmentEdgeManager.currentTimeMillis(), null); }
-                    if (table.getBaseColumnCount() == 0) {
-                        // If the base column count hasn't been set, then it means that the upgrade
-                        // to 4.5.0 is in progress. Have the client retry the mutation operation.
-                        return new MetaDataMutationResult(MutationCode.CONCURRENT_TABLE_MUTATION,
-                                EnvironmentEdgeManager.currentTimeMillis(), table);
-                    }
                 }
                 result = mutator.updateMutation(table, rowKeyMetaData, tableMetadata, region,
                             invalidateList, locks, clientTimeStamp);
@@ -1580,8 +1591,12 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             return null; // impossible
         }
     }
+    
+    private boolean isvalidAttribute(Object obj1, Object obj2) {
+    	return (obj1!=null && obj1.equals(obj2)) || (obj1==null && obj2==null); 
+    }
 
-    private void addRowsToChildViews(List<Mutation> tableMetadata, List<Mutation> mutationsForAddingColumnsToViews, byte[] schemaName, byte[] tableName,
+    private MetaDataMutationResult addRowsToChildViews(PTable table, List<Mutation> tableMetadata, List<Mutation> mutationsForAddingColumnsToViews, byte[] schemaName, byte[] tableName,
             List<ImmutableBytesPtr> invalidateList, long clientTimeStamp, TableViewFinderResult childViewsResult,
             Region region, List<RowLock> locks) throws IOException, SQLException {
         for (Result viewResult : childViewsResult.getResults()) {
@@ -1597,18 +1612,33 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             if (view.getBaseColumnCount() == QueryConstants.DIVERGED_VIEW_BASE_COLUMN_COUNT) {
                 // if a view has divorced itself from the base table, we don't allow schema changes
                 // to be propagated to it.
-                return;
+            	return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), null);
             }
-            int deltaNumberOfColumns = 0;
+            int numColsAddedToBaseTable = 0;
+            int numColsAddedToView = 0;
             short deltaNumPkColsSoFar = 0;
+            PColumn existingViewColumn = null;
+            List<PColumn> viewPkColumns = Lists.newArrayList(view.getPKColumns());
+            boolean addingPKColumn=false;
             for (Mutation m : tableMetadata) {
                 byte[][] rkmd = new byte[5][];
                 int pkCount = getVarChars(m.getRow(), rkmd);
                 if (m instanceof Put && pkCount > COLUMN_NAME_INDEX
                         && Bytes.compareTo(schemaName, rkmd[SCHEMA_NAME_INDEX]) == 0
                         && Bytes.compareTo(tableName, rkmd[TABLE_NAME_INDEX]) == 0) {
+                	try {
+                        // Maybe deserving of a new SchemaUtil.getColumnByName(byte[] familyName, String columnName) function 
+                        String columnName = Bytes.toString(rkmd[COLUMN_NAME_INDEX]);
+                        existingViewColumn = rkmd[FAMILY_NAME_INDEX] == null 
+                            ? view.getPKColumn(columnName) 
+                            : view.getColumnFamily(rkmd[FAMILY_NAME_INDEX]).getColumn(columnName);
+                    } 
+                	catch (ColumnFamilyNotFoundException e) {
+                    }
+                	catch (ColumnNotFoundException e) {
+                    } // Ignore - means column family or column name don't exist
+                	
                     Put p = (Put)m;
-
                     byte[] columnKey = ByteUtil.concat(viewKey, QueryConstants.SEPARATOR_BYTE_ARRAY, rkmd[COLUMN_NAME_INDEX]);
                     if (rkmd[FAMILY_NAME_INDEX] != null) {
                         columnKey = ByteUtil.concat(columnKey, QueryConstants.SEPARATOR_BYTE_ARRAY, rkmd[FAMILY_NAME_INDEX]);
@@ -1619,13 +1649,88 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                                 CellUtil.cloneQualifier(cell), cell.getTimestamp(), cell.getTypeByte(),
                                 CellUtil.cloneValue(cell)));
                     }
-                    deltaNumberOfColumns++;
+                    
+                    // if there is already a view column with the same name as the base table column we are trying to add
+                	if (existingViewColumn != null) {
+                		List<Cell> dataTypes = viewColumnDefinitionPut
+                                .get(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
+                                        PhoenixDatabaseMetaData.DATA_TYPE_BYTES);
+                		if (dataTypes != null && dataTypes.size() > 0) {
+                            Cell cell = dataTypes.get(0);
+                            int typeId = PInteger.INSTANCE.getCodec().decodeInt(cell.getValueArray(), cell.getValueOffset(), SortOrder.getDefault());
+                    		PDataType dataType = PDataType.fromTypeId(typeId);
+                    		if (!existingViewColumn.getDataType().equals(dataType)) {
+                    			 return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), null);
+                    		}
+                		}
+                		// if adding a pk column to the base table
+                		if (rkmd[FAMILY_NAME_INDEX] == null && rkmd[COLUMN_NAME_INDEX] != null) {
+	                        List<Cell> keySeqCells = viewColumnDefinitionPut.get(
+	                                PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
+	                                PhoenixDatabaseMetaData.KEY_SEQ_BYTES);
+	                        if (keySeqCells != null && keySeqCells.size() > 0) {
+	                        	Cell cell = keySeqCells.get(0);
+	                        	int keySeq = PSmallint.INSTANCE.getCodec().decodeInt(cell.getValueArray(), cell.getValueOffset(), SortOrder.getDefault());
+	                     		int pkPosition = SchemaUtil.getPKPosition(view, existingViewColumn)+1;
+	                     		if (pkPosition!=keySeq) {
+	                     			return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), null);
+	                     		}
+	                        }
+	                        List<Cell> sortOrders = viewColumnDefinitionPut.get(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
+                                    PhoenixDatabaseMetaData.SORT_ORDER_BYTES);
+	                        SortOrder sortOrder = SortOrder.getDefault();
+                            if (sortOrders != null && sortOrders.size() > 0) {
+                            	Cell cell = sortOrders.get(0);
+                            	int sortOrderInt = PInteger.INSTANCE.getCodec().decodeInt(cell.getValueArray(), cell.getValueOffset(), SortOrder.getDefault());
+                            	sortOrder = SortOrder.fromSystemValue(sortOrderInt);                            	
+                            }
+                            if (!Objects.equal(sortOrder,existingViewColumn.getSortOrder())) {
+                        		return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), null);
+                        	}
+	                        viewPkColumns.remove(existingViewColumn);
+                        }
+                		// if there is an existing view column that matches the column being added to the base table and if the column being added has a null
+                    	// scale or maxLength, we need to explicitly do a put to set the scale or maxLength to null (in case the view column has the scale or 
+                    	// max length set)
+                		Integer maxLength = null;
+                		List<Cell> columnSizes = viewColumnDefinitionPut.get(
+                                PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
+                                PhoenixDatabaseMetaData.COLUMN_SIZE_BYTES);
+                        if (columnSizes != null && columnSizes.size() > 0) {
+                            Cell cell = columnSizes.get(0);
+                            maxLength = cell.getValueArray()==null ? null :
+                    		PInteger.INSTANCE.getCodec().decodeInt(cell.getValueArray(), cell.getValueOffset(), SortOrder.getDefault());
+                        }
+                        if (!Objects.equal(maxLength,existingViewColumn.getMaxLength())) {
+                        	return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), null); 
+                        }
+                        Integer scale = null;
+                        List<Cell> decimalDigits = viewColumnDefinitionPut.get(
+                                PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
+                                PhoenixDatabaseMetaData.DECIMAL_DIGITS_BYTES);
+                        if (decimalDigits != null && decimalDigits.size() > 0) {
+                            Cell cell = decimalDigits.get(0);
+                            scale = cell.getValueArray()==null ? null :
+                        	PInteger.INSTANCE.getCodec().decodeInt(cell.getValueArray(), cell.getValueOffset(), SortOrder.getDefault());
+                        }
+                        if (!Objects.equal(scale,existingViewColumn.getScale())) {	
+                        	return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), null); 
+                        }
+                	}
+                	else {
+                    	// if we are adding a column that already exists in the view, no need to update the base table or view table column count
+                    	numColsAddedToView++;
+                    } 
+                    	
+                	
+                    numColsAddedToBaseTable++;
                     mutationsForAddingColumnsToViews.add(viewColumnDefinitionPut);
                     if (rkmd[FAMILY_NAME_INDEX] == null && rkmd[COLUMN_NAME_INDEX] != null) {
                         /*
                          * If adding a pk column to the base table (and hence the view), see if there are any indexes on
                          * the view. If yes, then generate puts for the index header row and column rows.
                          */
+                    	addingPKColumn=true;
                         deltaNumPkColsSoFar++;
                         for (PTable index : view.getIndexes()) {
                             int oldNumberOfColsInIndex = index.getColumns().size();
@@ -1714,6 +1819,12 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     }
                 }
             }
+            // allow adding a pk columns to base table :
+            // 1. if all the view pk columns are exactly the same as the base table pk columns
+            // 2. if we are adding all the existing view pk columns to the base table 
+            if (addingPKColumn && !viewPkColumns.equals(table.getPKColumns())) {
+            	return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION, EnvironmentEdgeManager.currentTimeMillis(), null);
+            }
             if (deltaNumPkColsSoFar > 0) {
                 for (PTable index : view.getIndexes()) {
                     byte[] indexHeaderRowKey = getViewIndexHeaderRowKey(index);
@@ -1743,9 +1854,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
 
             Put viewHeaderRowPut = new Put(viewKey, clientTimeStamp);
             byte[] baseColumnCountPtr = new byte[PInteger.INSTANCE.getByteSize()];
-            PInteger.INSTANCE.getCodec().encodeInt(oldBaseColumnCount + deltaNumberOfColumns, baseColumnCountPtr, 0);
+            PInteger.INSTANCE.getCodec().encodeInt(oldBaseColumnCount + numColsAddedToBaseTable, baseColumnCountPtr, 0);
             byte[] columnCountPtr = new byte[PInteger.INSTANCE.getByteSize()];
-            PInteger.INSTANCE.getCodec().encodeInt(view.getColumns().size() + deltaNumberOfColumns, columnCountPtr, 0);
+            PInteger.INSTANCE.getCodec().encodeInt(view.getColumns().size() + numColsAddedToView, columnCountPtr, 0);
             byte[] viewSequencePtr = new byte[PLong.INSTANCE.getByteSize()];
             PLong.INSTANCE.getCodec().encodeLong(view.getSequenceNumber() + 1, viewSequencePtr, 0);
             viewHeaderRowPut.addColumn(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES,
@@ -1759,7 +1870,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             // Update positions of view columns
             for (PColumn column : view.getColumns()) {
                 if (column.getPosition() >= oldBaseColumnCount) {
-                    int newPosition = column.getPosition() + deltaNumberOfColumns + 1;
+                    int newPosition = column.getPosition() + numColsAddedToView + 1;
 
                     byte[] k = ByteUtil.concat(viewKey, QueryConstants.SEPARATOR_BYTE_ARRAY, column.getName()
                             .getBytes());
@@ -1777,6 +1888,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             }
             invalidateList.add(new ImmutableBytesPtr(viewKey));
         }
+        return null;
     }
     
     private byte[] getViewIndexHeaderRowKey(PTable index) {
@@ -1813,16 +1925,24 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                     if (type == PTableType.TABLE || type == PTableType.SYSTEM) {
                         TableViewFinderResult childViewsResult = findChildViews(region, tenantId, table, PHYSICAL_TABLE_BYTES);
                         if (childViewsResult.hasViews()) {
-                            // Adding a column is not allowed if the meta-data for child view/s spans over
-                            // more than one region (since the changes cannot be done in a transactional fashion)
-                            if (!childViewsResult.allViewsInSingleRegion()) {
+                           /* 
+                            * Adding a column is not allowed if the meta-data for child view/s spans over
+                            * more than one region (since the changes cannot be made in a transactional fashion)
+                            * A base column count of 0 means that the metadata hasn't been upgraded yet or
+                            * the upgrade is currently in progress. If that is the case, disallow adding columns
+                            *  for tables with views.
+                            */
+                            if (!childViewsResult.allViewsInSingleRegion() || table.getBaseColumnCount() == 0) {
                                 return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
                                         EnvironmentEdgeManager.currentTimeMillis(), null);
                             } else {
                                 mutationsForAddingColumnsToViews = new ArrayList<>(childViewsResult.getResults().size() * tableMetaData.size());
-                                addRowsToChildViews(tableMetaData, mutationsForAddingColumnsToViews, schemaName, tableName, invalidateList, clientTimeStamp,
+                                MetaDataMutationResult mutationResult = addRowsToChildViews(table, tableMetaData, mutationsForAddingColumnsToViews, schemaName, tableName, invalidateList, clientTimeStamp,
                                         childViewsResult, region, locks);
-                            }
+                                // return if we were not able to add the column successfully
+                                if (mutationResult!=null)
+                                	return mutationResult;
+                            } 
                         }
                     }
                     for (Mutation m : tableMetaData) {
@@ -1987,7 +2107,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
             if(functionsAvailable.size() == numFunctions) return functionsAvailable;
 
             // Query for the latest table first, since it's not cached
-            List<PFunction> buildFunctions = buildFunctions(keys, region, clientTimeStamp);
+            List<PFunction> buildFunctions =
+                    buildFunctions(keys, region, clientTimeStamp, false,
+                        Collections.<Mutation> emptyList());
             if(buildFunctions == null || buildFunctions.isEmpty()) {
                 return null;
             }
@@ -2494,7 +2616,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                 // exists without making an additional query
                 ImmutableBytesPtr cacheKey = new FunctionBytesPtr(lockKey);
                 PFunction function =
-                        loadFunction(env, lockKey, cacheKey, clientTimeStamp, clientTimeStamp);
+                        loadFunction(env, lockKey, cacheKey, clientTimeStamp, clientTimeStamp, request.getReplace(), functionMetaData);
                 if (function != null) {
                     if (function.getTimeStamp() < clientTimeStamp) {
                         // If the function is older than the client time stamp and it's deleted,
@@ -2504,7 +2626,9 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements Coprocesso
                             builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
                             builder.addFunction(PFunction.toProto(function));
                             done.run(builder.build());
-                            return;
+                            if(!request.getReplace()) {
+                                return;
+                            }
                         }
                     } else {
                         builder.setReturnCode(MetaDataProtos.MutationCode.NEWER_FUNCTION_FOUND);
