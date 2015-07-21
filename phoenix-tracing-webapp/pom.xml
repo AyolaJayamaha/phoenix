@@ -53,21 +53,26 @@
         <version>${jettyVersion}</version>
         <scope>provided</scope>
       </dependency>
-    <dependency>
-        <groupId>org.apache.hadoop</groupId>
-        <artifactId>hadoop-common</artifactId>
+      <dependency>
+          <groupId>org.apache.hadoop</groupId>
+          <artifactId>hadoop-common</artifactId>
+          <scope>provided</scope>
+        </dependency>
+      <dependency>
+        <groupId>org.apache.phoenix</groupId>
+        <artifactId>phoenix-core</artifactId>
         <scope>provided</scope>
       </dependency>
-    <dependency>
-      <groupId>org.apache.hbase</groupId>
-      <artifactId>hbase-common</artifactId>
-      <scope>provided</scope>
-    </dependency>
-  <dependency>
+      <dependency>
+        <groupId>org.apache.hbase</groupId>
+        <artifactId>hbase-common</artifactId>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
         <groupId>commons-logging</groupId>
         <artifactId>commons-logging</artifactId>
         <scope>provided</scope>
-    </dependency>
+      </dependency>
     </dependencies>
 
     <build>
@@ -85,12 +90,6 @@
             <configuration>
               <tasks>
                 <ant antfile="src/build/build.xml"/>
-                <!--
-                  Place any ant task here. You can add anything
-                  you can add between <target> and </target> in a
-                  build.xml.
-                -->
- 
               </tasks>
             </configuration>
             <goals>

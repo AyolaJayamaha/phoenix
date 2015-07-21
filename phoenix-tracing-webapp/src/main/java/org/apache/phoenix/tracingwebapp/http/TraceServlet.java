@@ -23,6 +23,13 @@ import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
+
 /**
  *
  * Server to show trace information
@@ -32,11 +39,38 @@ import javax.servlet.http.HttpServletResponse;
  */
 
 public class TraceServlet extends HttpServlet {
-    protected void doGet(HttpServletRequest request, HttpServletResponse response)
-        throws ServletException, IOException {
-        response.setContentType("text/html");
-        response.setStatus(HttpServletResponse.SC_OK);
-        response.getWriter().println("<h1>Trace Servlet</h1>");
-        response.getWriter().println("session=" + request.getSession(true).getId());
+  protected void doGet(HttpServletRequest request, HttpServletResponse response)
+      throws ServletException, IOException {
+    response.setContentType("text/html");
+    connectMe();
+    response.setStatus(HttpServletResponse.SC_OK);
+    response.getWriter().println("<h1>Trace Servlet</h1>");
+    response.getWriter().println("session=" + request.getSession(true).getId());
+
+  }
+
+  public void connectMe() {
+    Statement stmt = null;
+    ResultSet rset = null;
+    try {
+      Connection con = DriverManager
+          .getConnection("jdbc:phoenix:localhost:2181");
+      stmt = con.createStatement();
+
+      stmt.executeUpdate("create table test (mykey integer not null primary key, mycolumn varchar)");
+      stmt.executeUpdate("upsert into test values (1,'Hello')");
+      stmt.executeUpdate("upsert into test values (2,'World!')");
+      con.commit();
+
+      PreparedStatement statement = con.prepareStatement("select * from test");
+      rset = statement.executeQuery();
+      while (rset.next()) {
+         System.out.println(rset.getString("mycolumn"));
+      }
+      statement.close();
+      con.close();
+    } catch (SQLException ex) {
+      System.out.println(ex);
     }
+  }
 }
