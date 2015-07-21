@@ -53,6 +53,7 @@ public class TraceServlet extends HttpServlet {
     Statement stmt = null;
     ResultSet rset = null;
     try {
+      Class.forName("org.apache.phoenix.jdbc.PhoenixDriver");
       Connection con = DriverManager
           .getConnection("jdbc:phoenix:localhost:2181");
       stmt = con.createStatement();
@@ -69,7 +70,7 @@ public class TraceServlet extends HttpServlet {
       }
       statement.close();
       con.close();
-    } catch (SQLException ex) {
+    } catch (Exception ex) {
       System.out.println(ex);
     }
   }
