@@ -121,7 +121,7 @@ public class TraceServlet extends HttpServlet {
     String json = null;
     String query = null;
     if(description!= null ) {
-      query = " Select * from SYSTEM.TRACING_STATS where DESCRIPTION like '"+description+"'";
+      query = " Select * from SYSTEM.TRACING_STATS where DESCRIPTION like '%"+description+"%'";
 
     }
     json = getResults(query);
