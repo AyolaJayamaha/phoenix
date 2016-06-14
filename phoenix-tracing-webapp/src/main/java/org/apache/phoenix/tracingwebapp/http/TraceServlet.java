@@ -56,6 +56,7 @@ public class TraceServlet extends HttpServlet {
     String limit = request.getParameter("limit");
     String traceid = request.getParameter("traceid");
     String parentid = request.getParameter("parentid");
+    String description = request.getParameter("description");
     String jsonObject = "{}";
     if ("getall".equals(action)) {
       jsonObject = getAll(limit);
@@ -65,6 +66,8 @@ public class TraceServlet extends HttpServlet {
       jsonObject = getCount(DEFAULT_COUNTBY);
     } else if ("searchTrace".equals(action)) {
       jsonObject = searchTrace(parentid, traceid, LOGIC_OR);
+    } else if ("searchDes".equals(action)) {
+      jsonObject = searchByDescription(description);
     } else {
       jsonObject = "{ \"Server\": \"Phoenix Tracing Web App\", \"API version\": 0.1 }";
     }
@@ -108,6 +111,18 @@ public class TraceServlet extends HttpServlet {
       query = "SELECT * FROM " + TRACING_TABLE + " WHERE parent_id="+parentId;
     }else if(parentId == null && traceId != null) {
       query = "SELECT * FROM " + TRACING_TABLE + " WHERE trace_id="+traceId;
+    }
+    json = getResults(query);
+    return getJson(json);
+  }
+  
+  //search the trace over description
+  protected String searchByDescription(String description) {
+    String json = null;
+    String query = null;
+    if(description!= null ) {
+      query = " Select * from SYSTEM.TRACING_STATS where DESCRIPTION like '"+description+"'";
+
     }
     json = getResults(query);
     return getJson(json);
