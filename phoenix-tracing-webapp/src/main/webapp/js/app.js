@@ -40,6 +40,10 @@ TraceApp.config(['$routeProvider',
         templateUrl: 'partials/dependency-tree.html',
         controller: 'TraceDepTreeCtrl'
       }).
+      when('/search-trace', {
+        templateUrl: 'partials/search-trace.html',
+        controller: 'SearchTraceCtrl'
+      }).
       when('/home', {
         templateUrl: 'partials/home.html'
       }).
