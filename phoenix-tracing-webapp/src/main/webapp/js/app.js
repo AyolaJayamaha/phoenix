@@ -4,7 +4,7 @@ var TraceApp = angular.module('TracingAppCtrl', [
     'UICtrl',
     'TimeLineCtrl',
     'DepTreeCtrl',
-    'SearchCtrl'
+    'SearchCtrl',
 ]);
 
 TraceApp.config(['$routeProvider',
@@ -42,7 +42,7 @@ TraceApp.config(['$routeProvider',
       }).
       when('/search-trace', {
         templateUrl: 'partials/search-trace.html',
-        controller: 'SearchTraceCtrl'
+        controller: 'TraceSearchCtrl'
       }).
       when('/home', {
         templateUrl: 'partials/home.html'
