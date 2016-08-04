@@ -51,6 +51,7 @@ TraceApp.config(['$routeProvider',
         templateUrl: 'partials/phoenix-trace.html'
       }).
       otherwise({
-        redirectTo: '/home'
+        templateUrl: 'partials/search-trace.html',
+        controller: 'TraceSearchCtrl'
       });
   }]);

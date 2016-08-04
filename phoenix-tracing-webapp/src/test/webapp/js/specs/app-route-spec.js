@@ -54,7 +54,8 @@ describe('The Tracing Web App Routes', function() {
 
     it('/',
       inject(function($route) {
-        expect($route.routes[null].redirectTo).toEqual('/home');
+        expect($route.routes['/search-trace'].controller).toBe('TraceSearchCtrl');
+        expect($route.routes['/search-trace'].templateUrl).toEqual('partials/search-trace.html');
       }));
 
   });
